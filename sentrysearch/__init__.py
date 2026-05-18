@@ -1,1 +1,1 @@
-"""sentrysearch - Search dashcam footage using natural language queries."""
+"""sentrysearch - Search video footage using Modal-hosted embeddings."""
