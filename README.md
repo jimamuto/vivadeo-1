@@ -145,3 +145,50 @@ sentrysearch dlq clear
 ```bash
 uv run pytest
 ```
+
+## Production Docker Stack
+
+SentrySearch can also run as a single-node production stack with FastAPI,
+Celery, Redis, Postgres/pgvector, and MinIO:
+
+```bash
+cp .env.example .env
+# edit SENTRYSEARCH_API_KEY before exposing the service
+docker compose up -d --build
+```
+
+The API is published on:
+
+```text
+http://localhost:8010
+```
+
+Core endpoints:
+
+- `GET /healthz`
+- `POST /v1/videos/upload`
+- `POST /v1/videos/url`
+- `POST /v1/search`
+- `POST /v1/clips`
+- `GET /v1/jobs/{job_id}`
+- `GET /v1/stats`
+
+Protected endpoints require:
+
+```text
+X-API-Key: <SENTRYSEARCH_API_KEY>
+```
+
+To point the CLI at the production API:
+
+```bash
+export SENTRYSEARCH_API_URL=http://localhost:8010
+export SENTRYSEARCH_API_KEY=<your-api-key>
+sentrysearch stats
+sentrysearch index /path/to/video.mp4
+sentrysearch search "red truck"
+```
+
+In API mode, indexing a single file uploads it to MinIO and queues an indexing
+job. Directory indexing uses the container's mounted `./media:/media:ro` path,
+so directory paths must be visible inside the API container.

@@ -1,0 +1,13 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.coverage
+htmlcov
+dist
+build
+*.egg-info
+~/.sentrysearch

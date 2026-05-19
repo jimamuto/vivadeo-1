@@ -1,9 +1,14 @@
 """Click-based CLI entry point."""
 
+import json
+import mimetypes
 import os
 import platform
 import shutil
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import click
 
@@ -30,6 +35,88 @@ def _open_file(path: str) -> None:
             )
     except Exception:
         pass
+
+
+def _api_configured() -> bool:
+    return bool(os.environ.get("SENTRYSEARCH_API_URL"))
+
+
+def _api_request(method: str, path: str, payload: dict | None = None) -> dict | list:
+    """Call the production API when SENTRYSEARCH_API_URL is configured."""
+    base_url = os.environ.get("SENTRYSEARCH_API_URL")
+    api_key = os.environ.get("SENTRYSEARCH_API_KEY")
+    if not base_url:
+        raise click.ClickException("SENTRYSEARCH_API_URL is not configured.")
+    if not api_key:
+        raise click.ClickException("SENTRYSEARCH_API_KEY is required for API mode.")
+
+    url = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()
+        raise click.ClickException(f"API request failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(f"Could not reach API: {exc}") from exc
+    return json.loads(body) if body else {}
+
+
+def _api_upload(path: str) -> dict:
+    base_url = os.environ.get("SENTRYSEARCH_API_URL")
+    api_key = os.environ.get("SENTRYSEARCH_API_KEY")
+    if not base_url:
+        raise click.ClickException("SENTRYSEARCH_API_URL is not configured.")
+    if not api_key:
+        raise click.ClickException("SENTRYSEARCH_API_KEY is required for API mode.")
+
+    filename = os.path.basename(path)
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    boundary = "----sentrysearchupload"
+    with open(path, "rb") as f:
+        file_bytes = f.read()
+    body = b"".join(
+        [
+            f"--{boundary}\r\n".encode(),
+            (
+                'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'
+            ).encode(),
+            f"Content-Type: {content_type}\r\n\r\n".encode(),
+            file_bytes,
+            f"\r\n--{boundary}--\r\n".encode(),
+        ]
+    )
+    url = urllib.parse.urljoin(base_url.rstrip("/") + "/", "/v1/videos/upload".lstrip("/"))
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "X-API-Key": api_key,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()
+        raise click.ClickException(f"API upload failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(f"Could not reach API: {exc}") from exc
 
 
 def _embed_batch_once(
@@ -101,6 +188,11 @@ def cli():
 @click.option("--verbose", is_flag=True, help="Show yt-dlp output.")
 def download_url(url, output_dir, max_height, index_after, verbose):
     """Download a lightweight MP4 from a video URL."""
+    if _api_configured() and index_after:
+        job = _api_request("POST", "/v1/videos/url", {"url": url, "max_height": max_height})
+        click.echo(f"Queued URL ingest job: {job['id']} (video: {job.get('video_id')})")
+        return
+
     from .downloader import VideoDownloadError, download_video_url
 
     try:
@@ -153,6 +245,16 @@ def download_url(url, output_dir, max_height, index_after, verbose):
 def index(directory, chunk_duration, overlap, preprocess, target_resolution,
           target_fps, skip_still, retry_failed, batch_size, verbose):
     """Index supported video files in DIRECTORY for searching."""
+    if _api_configured():
+        path = os.path.abspath(directory)
+        if os.path.isfile(path):
+            job = _api_upload(path)
+            click.echo(f"Uploaded and queued ingest job: {job['id']} (video: {job.get('video_id')})")
+        else:
+            job = _api_request("POST", "/v1/videos/local-path", {"path": path})
+            click.echo(f"Queued mounted-path ingest job: {job['id']} (video: {job.get('video_id')})")
+        return
+
     from .chunker import (
         SUPPORTED_VIDEO_EXTENSIONS,
         _get_video_duration,
@@ -377,6 +479,26 @@ def index(directory, chunk_duration, overlap, preprocess, target_resolution,
 @click.option("--verbose", is_flag=True, help="Show debug info.")
 def search(query, n_results, output_dir, trim, save_top, threshold, verbose):
     """Search indexed footage with a natural language QUERY."""
+    if _api_configured():
+        response = _api_request(
+            "POST",
+            "/v1/search",
+            {"query": query, "results": n_results, "threshold": threshold},
+        )
+        results = response.get("results", [])
+        if not results:
+            click.echo("No results found.")
+            return
+        for i, r in enumerate(results, 1):
+            start_str = _fmt_time(r["start_time"])
+            end_str = _fmt_time(r["end_time"])
+            click.echo(
+                f"  #{i} [{r['similarity_score']:.2f}] "
+                f"{r['filename']} @ {start_str}-{end_str} "
+                f"(video {r['video_id']})"
+            )
+        return
+
     from .embedder import get_embedder, reset_embedder
     from .search import search_footage
     from .store import VideoStore
@@ -489,6 +611,12 @@ def img(image, n_results, output_dir, trim, save_top, threshold, verbose):
 @cli.command()
 def stats():
     """Print index statistics."""
+    if _api_configured():
+        s = _api_request("GET", "/v1/stats")
+        click.echo(f"Total videos:  {s['total_videos']}")
+        click.echo(f"Total chunks:  {s['total_chunks']}")
+        return
+
     from .store import VideoStore
 
     store = VideoStore()
@@ -583,3 +711,23 @@ def dlq_clear():
     count = len(queue.entries())
     queue.clear()
     click.echo(f"Cleared {count} DLQ entries.")
+
+
+@cli.command("job")
+@click.argument("job_id")
+def job_status(job_id):
+    """Print production API job status when server mode is configured."""
+    job = _api_request("GET", f"/v1/jobs/{job_id}")
+    click.echo(
+        f"{job['id']} {job['kind']} {job['status']} "
+        f"{job['progress']:.0%} {job.get('message') or ''}"
+    )
+    if job.get("error"):
+        click.secho(job["error"], fg="red", err=True)
+
+
+@cli.command("api-health")
+def api_health():
+    """Check the configured production API."""
+    response = _api_request("GET", "/healthz")
+    click.echo(response.get("status", "unknown"))
